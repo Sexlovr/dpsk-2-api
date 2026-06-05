@@ -88,9 +88,22 @@ function messagesToPrompt(messages) {
 }
 
 /**
- * Build the DeepSeek completion payload.
+ * Map OpenAI-style model name to DeepSeek's internal model_type.
+ * Returns: "expert" (pro/default), "instant" (flash), or the raw value.
  */
-function buildDSPayload(messages, chatSessionId, model, parentMsgId) {
+function resolveModelType(model) {
+    var m = (model || '').toLowerCase();
+    if (m.includes('r1') || m.includes('reasoner')) return 'expert'; // R1 uses expert + thinking
+    if (m.includes('instant') || m.includes('flash') || m.includes('fast')) return 'instant';
+    return 'expert'; // default to expert (V3/V4 pro)
+}
+
+/**
+ * Build the DeepSeek completion payload.
+ * Matches upstream format exactly: parent_message_id is null for first msg,
+ * integer for continuation. model_type is set on first msg, null on continuation.
+ */
+function buildDSPayload(messages, chatSessionId, model, parentMsgId, isNewConv) {
     // Get the last user message
     var lastUserMsg = '';
     for (var i = messages.length - 1; i >= 0; i--) {
@@ -106,21 +119,28 @@ function buildDSPayload(messages, chatSessionId, model, parentMsgId) {
         .map(m => m.content || '')
         .join('\n');
 
-    // For continuation, we only send the latest user message
+    // For new conv, prepend system prompt; for continuation, just the latest user msg
     var prompt = lastUserMsg;
-    if (systemPrompt && !parentMsgId) {
+    if (systemPrompt && isNewConv) {
         prompt = systemPrompt + '\n\n' + lastUserMsg;
     }
 
-    var thinking = model === 'deepseek_r1';
+    // DeepSeek upstream: model_type on first message, null on continuation
+    var dsModelType = isNewConv ? resolveModelType(model) : null;
+
+    // thinking_enabled: true for expert/r1, can be true for instant too
+    var thinking = (model || '').toLowerCase().includes('r1') || dsModelType === 'expert';
 
     return {
         chat_session_id: chatSessionId,
-        parent_message_id: parentMsgId || '0',
+        parent_message_id: isNewConv ? null : (parentMsgId != null ? Number(parentMsgId) : null),
+        model_type: dsModelType,
         prompt: prompt,
         ref_file_ids: [],
         thinking_enabled: thinking,
-        search_enabled: false
+        search_enabled: false,
+        action: null,
+        preempt: false
     };
 }
 
@@ -421,6 +441,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             conv = null;
         }
 
+        var isNewConv = !conv;
+
         if (!conv) {
             // ═══ NEW CONVERSATION ═══
             db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
@@ -432,7 +454,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
 
             dsToken = await getAccountToken(account);
             chatSessionId = await createNewChat(dsToken);
-            parentMessageId = '0';
+            parentMessageId = null;
 
             db.prepare(
                 'INSERT INTO conversations (conv_key, api_key_hash, ds_chat_session_id, account_id, message_count, root_message_count, model) VALUES (?, ?, ?, ?, ?, ?, ?)'
@@ -451,7 +473,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
         var powResponse = await generatePowHeader(dsToken);
 
         // ── Build payload ──
-        var dsPayload = buildDSPayload(messages, chatSessionId, model, parentMessageId);
+        var dsPayload = buildDSPayload(messages, chatSessionId, model, parentMessageId, isNewConv);
 
         // ── Stream from DeepSeek ──
         if (stream) {
@@ -528,15 +550,35 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             var lastUserMsgId = null;
 
             try {
+                let isThinking = false;
                 for await (var event of sendChatCompletion(dsToken, dsPayload, abortController.signal, powResponse)) {
-                    if (event.choices && event.choices[0]) {
-                        var delta = event.choices[0].delta;
-                        if (delta && delta.content !== undefined) allContent.push(delta.content);
-                        if (event.message_id) lastMsgId = event.message_id;
-                    } else if (event.message_id) {
-                        lastMsgId = event.message_id;
-                        if (event.parent_id) lastUserMsgId = event.parent_id;
-                        if (event.content !== undefined) allContent.push(event.content);
+                    let contentDelta = null;
+
+                    if (typeof event.v === 'string') {
+                        if (!event.p || event.p.endsWith('/content')) {
+                            contentDelta = event.v;
+                        }
+                    } else if (Array.isArray(event.v) && event.v[0]?.content) {
+                        let frag = event.v[0];
+                        if (frag.type === 'RESPONSE' && isThinking) {
+                            contentDelta = "\n</think>\n\n" + frag.content;
+                            isThinking = false;
+                        } else {
+                            contentDelta = frag.content;
+                        }
+                    } else if (event.v?.response?.fragments?.length > 0) {
+                        let frag = event.v.response.fragments[0];
+                        contentDelta = frag.content;
+                        if (frag.type === 'THINK') {
+                            isThinking = true;
+                            contentDelta = "<think>\n" + contentDelta;
+                        }
+                        if (event.v.response.message_id) lastMsgId = event.v.response.message_id;
+                        if (event.v.response.parent_id) lastUserMsgId = event.v.response.parent_id;
+                    }
+
+                    if (contentDelta) {
+                        allContent.push(contentDelta);
                     }
                 }
             } catch (streamErr) {
