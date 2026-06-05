@@ -8,8 +8,6 @@ import {
     createNewChat, generatePowHeader, sendChatCompletion, solvePow
 } from './lib/deepseekClient.js';
 import { buildAdminPage } from './lib/page.js';
-import { playwrightLogin } from './lib/playwrightLogin.js';
-
 config();
 
 var app = express();
@@ -213,50 +211,37 @@ app.get('/admin/accounts', adminAuth, function (req, res) {
 
 app.post('/admin/accounts', adminAuth, async function (req, res) {
     var email = req.body.email;
-    var password = req.body.password;
-    var token = req.body.token;
+    var rawToken = req.body.token || '';
     if (!email) return res.status(400).json({ error: 'Email required' });
-    if (!password && !token) return res.status(400).json({ error: 'Either password or token required' });
+    if (!rawToken) return res.status(400).json({ error: 'Token required' });
 
-    var db = getDB();
-
-    // Direct token mode — store immediately
-    if (token && !password) {
-        try {
-            var existing = db.prepare('SELECT id FROM accounts WHERE email = ?').get(email);
-            if (existing) {
-                db.prepare('UPDATE accounts SET token = ?, active = 1 WHERE id = ?').run(token, existing.id);
-                return res.json({ message: 'Token updated!', id: existing.id });
-            }
-            var r = db.prepare('INSERT INTO accounts (email, password, token) VALUES (?, ?, ?)').run(email, '', token);
-            return res.json({ message: 'Account saved with token!', id: r.lastInsertRowid });
-        } catch (e) {
-            return res.status(500).json({ error: e.message });
+    // cURL Extraction Logic
+    if (rawToken.includes('curl ') || rawToken.includes('--cookie') || rawToken.includes('-H \'cookie:')) {
+        let cookieMatch = rawToken.match(/(?:--cookie|-H\s+['"]cookie:|-H\s+["']Cookie:)\s*['"]?([^'"]+)/i);
+        if (cookieMatch) {
+            let cookieStr = cookieMatch[1];
+            let dsMatch = cookieStr.match(/ds_session_id=([^;]+)/);
+            let wafMatch = cookieStr.match(/aws-waf-token=([^;]+)/);
+            
+            if (!dsMatch) return res.status(400).json({ error: "Failed to extract ds_session_id from the provided cURL. Are you sure you copied the request from chat.deepseek.com?" });
+            
+            rawToken = `ds_session_id=${dsMatch[1]}`;
+            if (wafMatch) rawToken += `; aws-waf-token=${wafMatch[1]}`;
         }
     }
 
-    // Playwright browser-login mode
+    var db = getDB();
+
     try {
-        var existing2 = db.prepare('SELECT id FROM accounts WHERE email = ?').get(email);
-        var accountId;
-        if (existing2) {
-            db.prepare('UPDATE accounts SET password = ? WHERE id = ?').run(password, existing2.id);
-            accountId = existing2.id;
-        } else {
-            var r2 = db.prepare('INSERT INTO accounts (email, password) VALUES (?, ?)').run(email, password);
-            accountId = r2.lastInsertRowid;
+        var existing = db.prepare('SELECT id FROM accounts WHERE email = ?').get(email);
+        if (existing) {
+            db.prepare('UPDATE accounts SET token = ?, active = 1, password = ? WHERE id = ?').run(rawToken, '', existing.id);
+            return res.json({ message: 'Token updated & extracted!', id: existing.id });
         }
-
-        res.json({ message: 'Account saved! Headless browser login starting (~15s)...', id: accountId });
-
-        playwrightLogin(email, password, { headless: false }).then(function (result) {
-            db.prepare('UPDATE accounts SET token = ?, active = 1 WHERE id = ?').run(result.token, accountId);
-            console.log('[PW-Login] Token captured for ' + email);
-        }).catch(function (e) {
-            console.error('[PW-Login] Failed for ' + email + ': ' + e.message);
-        });
+        var r = db.prepare('INSERT INTO accounts (email, password, token) VALUES (?, ?, ?)').run(email, '', rawToken);
+        return res.json({ message: 'Account saved with extracted token!', id: r.lastInsertRowid });
     } catch (e) {
-        res.status(500).json({ error: e.message });
+        return res.status(500).json({ error: e.message });
     }
 });
 
@@ -275,32 +260,7 @@ app.patch('/admin/accounts/:id', adminAuth, function (req, res) {
 });
 
 // Playwright-based automated login — captures real token from browser session
-app.post('/admin/accounts/:id/pw-login', adminAuth, async function (req, res) {
-    var id = req.params.id;
-    var db = getDB();
-    var account = db.prepare('SELECT * FROM accounts WHERE id = ?').get(id);
-    if (!account) return res.status(404).json({ error: 'Account not found' });
 
-    var password = req.body.password;
-    if (!password) return res.status(400).json({ error: 'Password required' });
-
-    // Store password for future reference and mark as pending
-    db.prepare('UPDATE accounts SET password = ? WHERE id = ?').run(password, id);
-
-    // Respond immediately; login runs in background
-    res.json({ message: 'Browser login started for ' + account.email + '. Token will be captured shortly...' });
-
-    // Run playwright login asynchronously
-    try {
-        console.log(`[PW-Login] Starting playwright login for ${account.email}...`);
-        var result = await playwrightLogin(account.email, password, { headless: false });
-        db.prepare('UPDATE accounts SET token = ?, active = 1 WHERE id = ?').run(result.token, id);
-        console.log(`[PW-Login] Token captured and saved for ${account.email}`);
-    } catch (e) {
-        console.error(`[PW-Login] Failed for ${account.email}: ${e.message}`);
-        db.prepare('UPDATE accounts SET active = 0 WHERE id = ?').run(id);
-    }
-});
 
 
 // ── API Keys ──
