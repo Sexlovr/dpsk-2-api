@@ -215,19 +215,20 @@ app.post('/admin/accounts', adminAuth, async function (req, res) {
     if (!email) return res.status(400).json({ error: 'Email required' });
     if (!rawToken) return res.status(400).json({ error: 'Token required' });
 
-    // cURL Extraction Logic
-    if (rawToken.includes('curl ') || rawToken.includes('--cookie') || rawToken.includes('-H \'cookie:')) {
-        let cookieMatch = rawToken.match(/(?:--cookie|-H\s+['"]cookie:|-H\s+["']Cookie:)\s*['"]?([^'"]+)/i);
-        if (cookieMatch) {
-            let cookieStr = cookieMatch[1];
-            let dsMatch = cookieStr.match(/ds_session_id=([^;]+)/);
-            let wafMatch = cookieStr.match(/aws-waf-token=([^;]+)/);
-            
-            if (!dsMatch) return res.status(400).json({ error: "Failed to extract ds_session_id from the provided cURL. Are you sure you copied the request from chat.deepseek.com?" });
-            
-            rawToken = `ds_session_id=${dsMatch[1]}`;
-            if (wafMatch) rawToken += `; aws-waf-token=${wafMatch[1]}`;
-        }
+    // cURL Extraction Logic — handles: -b '...', --cookie '...', -H 'cookie: ...'
+    if (rawToken.includes('curl ') || rawToken.includes('-b ') || rawToken.includes('--cookie') || rawToken.includes('ds_session_id')) {
+        // Match -b 'cookies' or --cookie 'cookies' (Chrome DevTools uses -b)
+        let cookieMatch = rawToken.match(/(?:-b|--cookie)\s+['"]([^'"]+)['"]/i)
+            || rawToken.match(/['"]([^'"]*ds_session_id=[^'"]+)['"]/i);
+        
+        let cookieStr = cookieMatch ? cookieMatch[1] : rawToken;
+        let dsMatch = cookieStr.match(/ds_session_id=([^;\s\\]+)/);
+        let wafMatch = cookieStr.match(/aws-waf-token=([^;\s\\'"]+)/);
+        
+        if (!dsMatch) return res.status(400).json({ error: "Failed to extract ds_session_id. Make sure you copied the request from chat.deepseek.com using 'Copy as cURL (bash)'." });
+        
+        rawToken = `ds_session_id=${dsMatch[1].trim()}`;
+        if (wafMatch) rawToken += `; aws-waf-token=${wafMatch[1].trim()}`;
     }
 
     var db = getDB();
