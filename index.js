@@ -529,6 +529,9 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             } catch (streamErr) {
                 if (streamErr.name !== 'AbortError') {
                     console.error('[Stream Error]', streamErr.message);
+                    if (!lastMsgId) {
+                        res.write(buildOpenAIChunk(completionId, model, { content: `\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}` }, null, null));
+                    }
                 }
             }
 
@@ -583,6 +586,9 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
                 }
             } catch (streamErr) {
                 console.error('[Stream Error]', streamErr.message);
+                if (!lastMsgId) {
+                    allContent.push(`\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}`);
+                }
             }
 
             if (lastMsgId) {
