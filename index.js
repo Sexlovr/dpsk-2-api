@@ -391,7 +391,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
         var stream = req.body.stream;
 
         var abortController = new AbortController();
-        req.on('close', () => { abortController.abort(); });
+        req.on('aborted', () => { abortController.abort(); });
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
             return res.status(400).json({ error: { message: 'messages array required', type: 'invalid_request' } });
@@ -477,6 +477,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
 
         // ── Stream from DeepSeek ──
         if (stream) {
+            console.log("\n[PROXY DS PAYLOAD]:", JSON.stringify(dsPayload, null, 2));
+
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
