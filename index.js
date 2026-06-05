@@ -86,59 +86,61 @@ function messagesToPrompt(messages) {
     }
     return parts;
 }
-
 /**
- * Map OpenAI-style model name to DeepSeek's internal model_type.
- * Returns: "expert" (pro/default), "instant" (flash), or the raw value.
+ * Map OpenAI-style model name to DeepSeek's internal payload requirements.
  */
-function resolveModelType(model) {
-    var m = (model || '').toLowerCase();
-    if (m.includes('r1') || m.includes('reasoner')) return 'expert'; // R1 uses expert + thinking
-    if (m.includes('instant') || m.includes('flash') || m.includes('fast')) return 'instant';
-    return 'expert'; // default to expert (V3/V4 pro)
+function resolveModelParams(modelStr) {
+    let m = (modelStr || '').toLowerCase();
+    
+    // Default fallback values
+    let params = {
+        model_type: m.includes('flash') || m.includes('instant') || m.includes('default') ? 'default' : 'expert',
+        thinking: false,
+        search: false
+    };
+
+    // Parsing flags
+    if (m.includes('thinking') || m.includes('r1') || m.includes('reasoner')) params.thinking = true;
+    if (m.includes('search')) params.search = true;
+
+    // Safety constraint: Expert can't have both thinking and search (user directive)
+    if (params.model_type === 'expert' && params.thinking && params.search) {
+        // Drop search if both are requested on expert
+        params.search = false; 
+    }
+
+    // Dynamic bypass: if it's none of the hardcoded names, use it as raw model_type just in case
+    if (!m.includes('pro') && !m.includes('flash') && !m.includes('expert') && !m.includes('instant') && !m.includes('default')) {
+        params.model_type = modelStr;
+    }
+
+    return params;
 }
 
 /**
- * Build the DeepSeek completion payload.
- * Matches upstream format exactly: parent_message_id is null for first msg,
- * integer for continuation. model_type is set on first msg, null on continuation.
+ * Build the stateless DeepSeek completion payload.
+ * We dump the entire conversation history into a single text prompt.
  */
-function buildDSPayload(messages, chatSessionId, model, parentMsgId, isNewConv) {
-    // Get the last user message
-    var lastUserMsg = '';
-    for (var i = messages.length - 1; i >= 0; i--) {
-        if (messages[i].role === 'user') {
-            lastUserMsg = messages[i].content || '';
-            break;
-        }
+function buildDSPayload(messages, chatSessionId, modelParams) {
+    // Dump everything in one message
+    let promptParts = [];
+    for (let m of messages) {
+        if (!m.content) continue;
+        if (m.role === 'system') promptParts.push(`[System]:\n${m.content}`);
+        else if (m.role === 'assistant') promptParts.push(`[Assistant]:\n${m.content}`);
+        else promptParts.push(`[User]:\n${m.content}`);
     }
-
-    // Build the system prompt from system messages
-    var systemPrompt = messages
-        .filter(m => m.role === 'system')
-        .map(m => m.content || '')
-        .join('\n');
-
-    // For new conv, prepend system prompt; for continuation, just the latest user msg
-    var prompt = lastUserMsg;
-    if (systemPrompt && isNewConv) {
-        prompt = systemPrompt + '\n\n' + lastUserMsg;
-    }
-
-    // DeepSeek upstream: model_type on first message, null on continuation
-    var dsModelType = isNewConv ? resolveModelType(model) : null;
-
-    // thinking_enabled: true for expert/r1, can be true for instant too
-    var thinking = (model || '').toLowerCase().includes('r1') || dsModelType === 'expert';
+    
+    let combinedPrompt = promptParts.join('\n\n');
 
     return {
         chat_session_id: chatSessionId,
-        parent_message_id: isNewConv ? null : (parentMsgId != null ? Number(parentMsgId) : null),
-        model_type: dsModelType,
-        prompt: prompt,
+        parent_message_id: null,
+        model_type: modelParams.model_type,
+        prompt: combinedPrompt,
         ref_file_ids: [],
-        thinking_enabled: thinking,
-        search_enabled: false,
+        thinking_enabled: modelParams.thinking,
+        search_enabled: modelParams.search,
         action: null,
         preempt: false
     };
@@ -402,78 +404,27 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             return res.status(400).json({ error: { message: 'At least one user message required', type: 'invalid_request' } });
         }
 
+        var account = getNextAccount();
+        if (!account) {
+            return res.status(503).json({ error: { message: 'No active accounts available', type: 'server_error' } });
+        }
+
         var completionId = generateId();
-        var convKey = generateConvKey(messages);
-        var apiKeyHash = req.apiKeyHash;
 
-        // ── Look up existing conversation ──
-        var timeoutModifier = '-' + CONV_TIMEOUT + ' minutes';
-        var conv = db.prepare(
-            "SELECT * FROM conversations WHERE conv_key = ? AND api_key_hash = ? AND last_used > datetime('now', ?)"
-        ).get(convKey, apiKeyHash, timeoutModifier);
-
-        var account, dsToken, chatSessionId, parentMessageId;
-
-        if (conv && messages.length > conv.message_count) {
-            // ═══ CONTINUATION ═══
-            account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(conv.account_id);
-            if (account) {
-                chatSessionId = conv.ds_chat_session_id;
-                parentMessageId = conv.parent_message_id || '0';
-                console.log(`[Conv] Continuation: ${convKey.slice(0, 12)}... | msgs: ${conv.message_count} -> ${messages.length}`);
-            } else {
-                db.prepare('DELETE FROM conversations WHERE id = ?').run(conv.id);
-                conv = null;
-            }
-        } else if (conv && messages.length === conv.message_count && conv.parent_message_id) {
-            // ═══ REROLL ═══
-            account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(conv.account_id);
-            if (account) {
-                chatSessionId = conv.ds_chat_session_id;
-                // For reroll, use the last user msg id as parent (go back one step)
-                parentMessageId = conv.last_user_msg_id || conv.parent_message_id || '0';
-                console.log(`[Conv] Reroll: ${convKey.slice(0, 12)}... | msgs: ${messages.length}`);
-            } else {
-                db.prepare('DELETE FROM conversations WHERE id = ?').run(conv.id);
-                conv = null;
-            }
-        } else {
-            conv = null;
-        }
-
-        var isNewConv = !conv;
-
-        if (!conv) {
-            // ═══ NEW CONVERSATION ═══
-            db.prepare('DELETE FROM conversations WHERE conv_key = ? AND api_key_hash = ?').run(convKey, apiKeyHash);
-
-            account = getNextAccount();
-            if (!account) {
-                return res.status(503).json({ error: { message: 'No active accounts available', type: 'server_error' } });
-            }
-
-            dsToken = await getAccountToken(account);
-            chatSessionId = await createNewChat(dsToken);
-            parentMessageId = null;
-
-            db.prepare(
-                'INSERT INTO conversations (conv_key, api_key_hash, ds_chat_session_id, account_id, message_count, root_message_count, model) VALUES (?, ?, ?, ?, ?, ?, ?)'
-            ).run(convKey, apiKeyHash, chatSessionId, account.id, messages.length, messages.length, model);
-
-            console.log(`[Conv] New: ${convKey.slice(0, 12)}... | msgs: ${messages.length} | account: ${account.email}`);
-        }
-
-        if (!dsToken) {
-            dsToken = await getAccountToken(account);
-        }
+        // We are going fully stateless: every API call makes a brand new chat on deepseek
+        var dsToken = await getAccountToken(account);
+        var chatSessionId = await createNewChat(dsToken);
 
         bumpAccountUsage(account.id);
+
+        console.log(`[Stateless] New Request: msgs=${messages.length} | model=${model} | account=${account.email}`);
 
         // ── Solve PoW ──
         var powResponse = await generatePowHeader(dsToken);
 
         // ── Build payload ──
-        var dsPayload = buildDSPayload(messages, chatSessionId, model, parentMessageId, isNewConv);
+        var modelParams = resolveModelParams(model);
+        var dsPayload = buildDSPayload(messages, chatSessionId, modelParams);
 
         // ── Stream from DeepSeek ──
         if (stream) {
@@ -519,8 +470,6 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
                             isThinking = true;
                             contentDelta = "<think>\n" + contentDelta;
                         }
-                        if (event.v.response.message_id) lastMsgId = event.v.response.message_id;
-                        if (event.v.response.parent_id) lastUserMsgId = event.v.response.parent_id;
                     }
 
                     if (contentDelta) {
@@ -531,17 +480,8 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             } catch (streamErr) {
                 if (streamErr.name !== 'AbortError') {
                     console.error('[Stream Error]', streamErr.message);
-                    if (!lastMsgId) {
-                        res.write(buildOpenAIChunk(completionId, model, { content: `\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}` }, null, null));
-                    }
+                    res.write(buildOpenAIChunk(completionId, model, { content: `\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}` }, null, null));
                 }
-            }
-
-            // Update conversation state
-            if (lastMsgId) {
-                db.prepare(
-                    "UPDATE conversations SET parent_message_id = ?, last_user_msg_id = ?, message_count = ?, model = ?, last_used = datetime('now') WHERE conv_key = ? AND api_key_hash = ?"
-                ).run(lastMsgId, lastUserMsgId, messages.length, model, convKey, apiKeyHash);
             }
 
             res.write(buildOpenAIChunk(completionId, model, {}, 'stop', null));
@@ -591,12 +531,6 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
                 if (!lastMsgId) {
                     allContent.push(`\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}`);
                 }
-            }
-
-            if (lastMsgId) {
-                db.prepare(
-                    "UPDATE conversations SET parent_message_id = ?, last_user_msg_id = ?, message_count = ?, model = ?, last_used = datetime('now') WHERE conv_key = ? AND api_key_hash = ?"
-                ).run(lastMsgId, lastUserMsgId, messages.length, model, convKey, apiKeyHash);
             }
 
             res.json(buildOpenAIResponse(completionId, model, allContent.join('')));
