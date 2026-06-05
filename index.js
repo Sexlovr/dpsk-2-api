@@ -215,20 +215,26 @@ app.post('/admin/accounts', adminAuth, async function (req, res) {
     if (!email) return res.status(400).json({ error: 'Email required' });
     if (!rawToken) return res.status(400).json({ error: 'Token required' });
 
-    // cURL Extraction Logic — handles: -b '...', --cookie '...', -H 'cookie: ...'
+    // cURL Extraction Logic — handles: -b '...', --cookie '...', -H 'cookie: ...', and 'authorization: Bearer ...'
     if (rawToken.includes('curl ') || rawToken.includes('-b ') || rawToken.includes('--cookie') || rawToken.includes('ds_session_id')) {
-        // Match -b 'cookies' or --cookie 'cookies' (Chrome DevTools uses -b)
         let cookieMatch = rawToken.match(/(?:-b|--cookie)\s+['"]([^'"]+)['"]/i)
-            || rawToken.match(/['"]([^'"]*ds_session_id=[^'"]+)['"]/i);
+            || rawToken.match(/['"]([^'"]*ds_session_id=[^'"]+)['"]/i) || [null, rawToken];
         
-        let cookieStr = cookieMatch ? cookieMatch[1] : rawToken;
+        let cookieStr = cookieMatch[1] || rawToken;
         let dsMatch = cookieStr.match(/ds_session_id=([^;\s\\]+)/);
         let wafMatch = cookieStr.match(/aws-waf-token=([^;\s\\'"]+)/);
+        let bearerMatch = rawToken.match(/(?:authorization:\s*Bearer|bearer)\s+([A-Za-z0-9+/=a-z0-9_-]+)/i);
         
         if (!dsMatch) return res.status(400).json({ error: "Failed to extract ds_session_id. Make sure you copied the request from chat.deepseek.com using 'Copy as cURL (bash)'." });
+        if (!bearerMatch) return res.status(400).json({ error: "Failed to extract Bearer token from the cURL payload. DeepSeek requires both cookies and the JWT token." });
         
-        rawToken = `ds_session_id=${dsMatch[1].trim()}`;
-        if (wafMatch) rawToken += `; aws-waf-token=${wafMatch[1].trim()}`;
+        let finalCookie = `ds_session_id=${dsMatch[1].trim()}`;
+        if (wafMatch) finalCookie += `; aws-waf-token=${wafMatch[1].trim()}`;
+        
+        rawToken = JSON.stringify({
+            bearer: bearerMatch[1],
+            cookie: finalCookie
+        });
     }
 
     var db = getDB();
