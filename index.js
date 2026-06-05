@@ -466,26 +466,42 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             var lastUserMsgId = null;
             var totalContent = '';
 
+            let isThinking = false;
+
             try {
                 for await (var event of sendChatCompletion(dsToken, dsPayload, abortController.signal, powResponse)) {
-                    // DeepSeek SSE events have different shapes
-                    // Main content comes in choices[0].delta.content or directly in .content
-                    if (event.choices && event.choices[0]) {
-                        var delta = event.choices[0].delta;
-                        if (delta && delta.content !== undefined) {
-                            totalContent += delta.content;
-                            res.write(buildOpenAIChunk(completionId, model, { content: delta.content }, null, null));
+                    let contentDelta = null;
+
+                    // DeepSeek JSON Diff Stream parsing
+                    if (typeof event.v === 'string') {
+                        // Incremental token
+                        if (!event.p || event.p.endsWith('/content')) {
+                            contentDelta = event.v;
                         }
-                        // Track message ID
-                        if (event.message_id) lastMsgId = event.message_id;
-                    } else if (event.message_id) {
-                        lastMsgId = event.message_id;
-                        if (event.parent_id) lastUserMsgId = event.parent_id;
-                        // content field directly
-                        if (event.content !== undefined) {
-                            totalContent += event.content;
-                            res.write(buildOpenAIChunk(completionId, model, { content: event.content }, null, null));
+                    } else if (Array.isArray(event.v) && event.v[0]?.content) {
+                        // New fragment appended (e.g transition from THINK to RESPONSE block)
+                        let frag = event.v[0];
+                        if (frag.type === 'RESPONSE' && isThinking) {
+                            contentDelta = "\n</think>\n\n" + frag.content;
+                            isThinking = false;
+                        } else {
+                            contentDelta = frag.content;
                         }
+                    } else if (event.v?.response?.fragments?.length > 0) {
+                        // Initial root payload
+                        let frag = event.v.response.fragments[0];
+                        contentDelta = frag.content;
+                        if (frag.type === 'THINK') {
+                            isThinking = true;
+                            contentDelta = "<think>\n" + contentDelta;
+                        }
+                        if (event.v.response.message_id) lastMsgId = event.v.response.message_id;
+                        if (event.v.response.parent_id) lastUserMsgId = event.v.response.parent_id;
+                    }
+
+                    if (contentDelta) {
+                        totalContent += contentDelta;
+                        res.write(buildOpenAIChunk(completionId, model, { content: contentDelta }, null, null));
                     }
                 }
             } catch (streamErr) {
