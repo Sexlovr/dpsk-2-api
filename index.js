@@ -57,34 +57,80 @@ async function getAccountToken(account) {
 }
 
 /**
- * Generate a conversation fingerprint from messages.
+ * Stringify message content for hashing/prompting. Handles OpenAI multimodal
+ * content arrays by extracting text blocks; ignores image/audio parts.
  */
-function generateConvKey(messages) {
-    // Use first 3 user messages to create a stable fingerprint
-    var userMsgs = messages.filter(m => m.role === 'user');
-    var sample = userMsgs.slice(0, 3).map(m => (m.content || '').slice(0, 200)).join('|||');
-    return crypto.createHash('sha256').update(sample).digest('hex');
+function contentToText(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content
+            .filter(c => c && c.type === 'text' && typeof c.text === 'string')
+            .map(c => c.text)
+            .join('\n');
+    }
+    return '';
 }
 
 /**
- * Convert OpenAI messages format to a DeepSeek prompt string.
- * DeepSeek just wants a prompt string; we merge chat history.
+ * Find the index of the last user message — that's the "current turn".
+ * Everything before it is the prior conversation state.
  */
-function messagesToPrompt(messages) {
-    var parts = [];
-    for (var m of messages) {
-        var role = m.role;
-        var content = m.content || '';
-        if (role === 'system') {
-            parts.push(content);
-        } else if (role === 'user') {
-            parts.push(content);
-        } else if (role === 'assistant') {
-            // Only include for continuation context
-            parts.push(content);
-        }
+function findLastUserIndex(messages) {
+    for (var i = messages.length - 1; i >= 0; i--) {
+        if (messages[i].role === 'user') return i;
     }
-    return parts;
+    return -1;
+}
+
+/**
+ * State hash = sha256(api_key_hash | role+content of every message BEFORE
+ * the latest user message). Used to find an existing DS session whose
+ * stored "post-response" state matches this request's prior context.
+ *
+ * Properties:
+ *  - api_key_hash mixed in → cross-user isolation even on hash collision.
+ *  - Excludes the latest user message → reroll/edit of latest user msg
+ *    still matches the same parent.
+ *  - At turn 1 the prior context is just [system,greeting]; we deliberately
+ *    never store that pre-turn-1 hash, so two parallel chats from the same
+ *    character (identical system+greeting) each get their own fresh DS
+ *    session and only diverge on later turns. No collision possible.
+ */
+function computeStateHash(apiKeyHash, messages) {
+    var lastUser = findLastUserIndex(messages);
+    if (lastUser <= 0) return null; // no prior context to match
+    var prior = messages.slice(0, lastUser);
+    var h = crypto.createHash('sha256');
+    h.update(apiKeyHash);
+    h.update('\x00');
+    for (var m of prior) {
+        h.update(m.role || '');
+        h.update('\x01');
+        h.update(contentToText(m.content));
+        h.update('\x02');
+    }
+    return h.digest('hex');
+}
+
+/**
+ * Hash of the full message list including the latest user message AND the
+ * assistant response we just produced. Stored after a successful turn so
+ * the *next* turn's prior-state lookup matches.
+ */
+function computePostStateHash(apiKeyHash, messages, assistantContent) {
+    var h = crypto.createHash('sha256');
+    h.update(apiKeyHash);
+    h.update('\x00');
+    for (var m of messages) {
+        h.update(m.role || '');
+        h.update('\x01');
+        h.update(contentToText(m.content));
+        h.update('\x02');
+    }
+    h.update('assistant\x01');
+    h.update(assistantContent || '');
+    h.update('\x02');
+    return h.digest('hex');
 }
 /**
  * Map OpenAI-style model name to DeepSeek's internal payload requirements.
@@ -121,23 +167,35 @@ function resolveModelParams(modelStr) {
  * Build the stateless DeepSeek completion payload.
  * We dump the entire conversation history into a single text prompt.
  */
-function buildDSPayload(messages, chatSessionId, modelParams) {
-    // Dump everything in one message
-    let promptParts = [];
-    for (let m of messages) {
-        if (!m.content) continue;
-        if (m.role === 'system') promptParts.push(`[System]:\n${m.content}`);
-        else if (m.role === 'assistant') promptParts.push(`[Assistant]:\n${m.content}`);
-        else promptParts.push(`[User]:\n${m.content}`);
+function buildDSPayload(messages, chatSessionId, modelParams, continuation) {
+    let prompt;
+    let parentMessageId;
+    let modelType;
+
+    if (continuation && continuation.parentMessageId != null) {
+        const lastUser = findLastUserIndex(messages);
+        prompt = contentToText(messages[lastUser].content);
+        parentMessageId = continuation.parentMessageId;
+        modelType = null;
+    } else {
+        const promptParts = [];
+        for (const m of messages) {
+            const text = contentToText(m.content);
+            if (!text) continue;
+            if (m.role === 'system') promptParts.push(`[System]:\n${text}`);
+            else if (m.role === 'assistant') promptParts.push(`[Assistant]:\n${text}`);
+            else promptParts.push(`[User]:\n${text}`);
+        }
+        prompt = promptParts.join('\n\n');
+        parentMessageId = null;
+        modelType = modelParams.model_type;
     }
-    
-    let combinedPrompt = promptParts.join('\n\n');
 
     return {
         chat_session_id: chatSessionId,
-        parent_message_id: null,
-        model_type: modelParams.model_type,
-        prompt: combinedPrompt,
+        parent_message_id: parentMessageId,
+        model_type: modelType,
+        prompt: prompt,
         ref_file_ids: [],
         thinking_enabled: modelParams.thinking,
         search_enabled: modelParams.search,
@@ -351,8 +409,8 @@ app.patch('/admin/models/:id', adminAuth, function (req, res) {
 // ── Conversations ──
 app.get('/admin/conversations', adminAuth, function (req, res) {
     var rows = getDB().prepare(
-        'SELECT c.id, c.conv_key, c.ds_chat_session_id, c.account_id, c.message_count, ' +
-        'c.model, c.last_used, c.created_at, a.email ' +
+        'SELECT c.id, c.state_hash, c.ds_chat_session_id, c.account_id, c.message_count, ' +
+        'c.parent_message_id, c.model, c.last_used, c.created_at, a.email ' +
         'FROM conversations c ' +
         'LEFT JOIN accounts a ON c.account_id = a.id ' +
         'ORDER BY c.last_used DESC LIMIT 100'
@@ -389,7 +447,7 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
 
     try {
         var messages = req.body.messages;
-        var model = req.body.model || 'deepseek_chat';
+        var model = req.body.model || 'deepseek-v4-pro';
         var stream = req.body.stream;
 
         var abortController = new AbortController();
@@ -404,32 +462,132 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             return res.status(400).json({ error: { message: 'At least one user message required', type: 'invalid_request' } });
         }
 
-        var account = getNextAccount();
-        if (!account) {
-            return res.status(503).json({ error: { message: 'No active accounts available', type: 'server_error' } });
+        // ── Look up an existing DS session whose stored post-state matches
+        //    this request's prior context (everything before the latest user msg).
+        //    Scoped per api-key for isolation. Skipped at turn 1 (no prior).
+        var apiKeyHash = req.apiKeyHash;
+        var stateHash = computeStateHash(apiKeyHash, messages);
+        var existingConv = null;
+        if (stateHash) {
+            existingConv = db.prepare(
+                "SELECT * FROM conversations " +
+                "WHERE api_key_hash = ? AND state_hash = ? " +
+                "AND last_used > datetime('now', ?) " +
+                "ORDER BY last_used DESC LIMIT 1"
+            ).get(apiKeyHash, stateHash, '-' + CONV_TIMEOUT + ' minutes');
         }
 
-        var completionId = generateId();
+        var account;
+        var chatSessionId;
+        var continuation = null;
 
-        // We are going fully stateless: every API call makes a brand new chat on deepseek
-        var dsToken = await getAccountToken(account);
-        var chatSessionId = await createNewChat(dsToken);
+        if (existingConv) {
+            account = db.prepare('SELECT * FROM accounts WHERE id = ? AND active = 1').get(existingConv.account_id);
+            if (account) {
+                chatSessionId = existingConv.ds_chat_session_id;
+                continuation = { parentMessageId: existingConv.parent_message_id };
+                console.log(`[Conv] Continuation: state=${stateHash.slice(0, 12)} session=${chatSessionId.slice(0, 8)} parent=${continuation.parentMessageId} account=${account.email}`);
+            } else {
+                // Account got deactivated — discard the stale row, fall through to new session
+                db.prepare('DELETE FROM conversations WHERE id = ?').run(existingConv.id);
+                existingConv = null;
+            }
+        }
+
+        if (!existingConv) {
+            account = getNextAccount();
+            if (!account) {
+                return res.status(503).json({ error: { message: 'No active accounts available', type: 'server_error' } });
+            }
+            var dsTokenForCreate = await getAccountToken(account);
+            chatSessionId = await createNewChat(dsTokenForCreate);
+            console.log(`[Conv] New: state=${stateHash ? stateHash.slice(0, 12) : 'turn1'} session=${chatSessionId.slice(0, 8)} account=${account.email}`);
+        }
 
         bumpAccountUsage(account.id);
 
-        console.log(`[Stateless] New Request: msgs=${messages.length} | model=${model} | account=${account.email}`);
-
-        // ── Solve PoW ──
+        var completionId = generateId();
+        var dsToken = await getAccountToken(account);
         var powResponse = await generatePowHeader(dsToken);
-
-        // ── Build payload ──
         var modelParams = resolveModelParams(model);
-        var dsPayload = buildDSPayload(messages, chatSessionId, modelParams);
+        var dsPayload = buildDSPayload(messages, chatSessionId, modelParams, continuation);
 
-        // ── Stream from DeepSeek ──
+        if (process.env.DEBUG === '1') {
+            console.log("[PROXY DS PAYLOAD]:", JSON.stringify({ ...dsPayload, prompt: dsPayload.prompt.slice(0, 200) + (dsPayload.prompt.length > 200 ? '...' : '') }));
+        }
+
+        // ── Shared streaming consumer ──
+        // Yields: {kind:'content'|'thinking_open'|'thinking_close', text}
+        //         and side-effects responseMsgId/upstreamError on the closure.
+        var responseMsgId = null;
+        var upstreamError = null;
+
+        async function* consumeDS() {
+            let isThinking = false;
+            for await (var event of sendChatCompletion(dsToken, dsPayload, abortController.signal, powResponse)) {
+                // ── 1. Capture response_message_id from the very first frame
+                //    (shape: {request_message_id, response_message_id, model_type})
+                if (event && event.response_message_id != null && responseMsgId == null) {
+                    responseMsgId = event.response_message_id;
+                }
+
+                // ── 2. Detect upstream error events (e.g. input_exceeds_limit).
+                //    DeepSeek emits: {type:"error", content:"...", finish_reason:"..."}
+                if (event && event.type === 'error') {
+                    upstreamError = event.content || event.finish_reason || 'Upstream error';
+                    throw new Error(`DeepSeek: ${upstreamError}`);
+                }
+
+                // ── 3. Capture response_message_id from the initial root payload too
+                if (event.v?.response?.message_id != null && responseMsgId == null) {
+                    responseMsgId = event.v.response.message_id;
+                }
+
+                // ── 4. Map content to deltas ──
+                let contentDelta = null;
+                if (typeof event.v === 'string') {
+                    if (!event.p || event.p.endsWith('/content')) {
+                        contentDelta = event.v;
+                    }
+                } else if (Array.isArray(event.v) && event.v[0]?.content) {
+                    let frag = event.v[0];
+                    if (frag.type === 'RESPONSE' && isThinking) {
+                        contentDelta = "\n</think>\n\n" + frag.content;
+                        isThinking = false;
+                    } else {
+                        contentDelta = frag.content;
+                    }
+                } else if (event.v?.response?.fragments?.length > 0) {
+                    let frag = event.v.response.fragments[0];
+                    contentDelta = frag.content;
+                    if (frag.type === 'THINK') {
+                        isThinking = true;
+                        contentDelta = "<think>\n" + contentDelta;
+                    }
+                }
+
+                if (contentDelta) yield contentDelta;
+            }
+        }
+
+        // ── Persist the new state row after a successful turn ──
+        function storePostState(assistantContent) {
+            if (responseMsgId == null) return;
+            var postHash = computePostStateHash(apiKeyHash, messages, assistantContent);
+            if (existingConv) {
+                db.prepare(
+                    "UPDATE conversations SET state_hash = ?, parent_message_id = ?, " +
+                    "message_count = ?, model = ?, last_used = datetime('now') WHERE id = ?"
+                ).run(postHash, responseMsgId, messages.length + 1, model, existingConv.id);
+            } else {
+                db.prepare(
+                    "INSERT INTO conversations (state_hash, api_key_hash, ds_chat_session_id, " +
+                    "account_id, parent_message_id, model, message_count) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                ).run(postHash, apiKeyHash, chatSessionId, account.id, responseMsgId, model, messages.length + 1);
+            }
+        }
+
         if (stream) {
-            console.log("\n[PROXY DS PAYLOAD]:", JSON.stringify(dsPayload, null, 2));
-
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
@@ -437,46 +595,13 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
 
             res.write(buildOpenAIChunk(completionId, model, { role: 'assistant', content: '' }, null, null));
 
-            var lastMsgId = null;
-            var lastUserMsgId = null;
             var totalContent = '';
-
-            let isThinking = false;
-
             try {
-                for await (var event of sendChatCompletion(dsToken, dsPayload, abortController.signal, powResponse)) {
-                    let contentDelta = null;
-
-                    // DeepSeek JSON Diff Stream parsing
-                    if (typeof event.v === 'string') {
-                        // Incremental token
-                        if (!event.p || event.p.endsWith('/content')) {
-                            contentDelta = event.v;
-                        }
-                    } else if (Array.isArray(event.v) && event.v[0]?.content) {
-                        // New fragment appended (e.g transition from THINK to RESPONSE block)
-                        let frag = event.v[0];
-                        if (frag.type === 'RESPONSE' && isThinking) {
-                            contentDelta = "\n</think>\n\n" + frag.content;
-                            isThinking = false;
-                        } else {
-                            contentDelta = frag.content;
-                        }
-                    } else if (event.v?.response?.fragments?.length > 0) {
-                        // Initial root payload
-                        let frag = event.v.response.fragments[0];
-                        contentDelta = frag.content;
-                        if (frag.type === 'THINK') {
-                            isThinking = true;
-                            contentDelta = "<think>\n" + contentDelta;
-                        }
-                    }
-
-                    if (contentDelta) {
-                        totalContent += contentDelta;
-                        res.write(buildOpenAIChunk(completionId, model, { content: contentDelta }, null, null));
-                    }
+                for await (var delta of consumeDS()) {
+                    totalContent += delta;
+                    res.write(buildOpenAIChunk(completionId, model, { content: delta }, null, null));
                 }
+                storePostState(totalContent);
             } catch (streamErr) {
                 if (streamErr.name !== 'AbortError') {
                     console.error('[Stream Error]', streamErr.message);
@@ -489,51 +614,20 @@ app.post('/v1/chat/completions', apiKeyAuth, async function (req, res) {
             res.end();
 
         } else {
-            // ═══ NON-STREAMING ═══
             var allContent = [];
-            var lastMsgId = null;
-            var lastUserMsgId = null;
-
             try {
-                let isThinking = false;
-                for await (var event of sendChatCompletion(dsToken, dsPayload, abortController.signal, powResponse)) {
-                    let contentDelta = null;
-
-                    if (typeof event.v === 'string') {
-                        if (!event.p || event.p.endsWith('/content')) {
-                            contentDelta = event.v;
-                        }
-                    } else if (Array.isArray(event.v) && event.v[0]?.content) {
-                        let frag = event.v[0];
-                        if (frag.type === 'RESPONSE' && isThinking) {
-                            contentDelta = "\n</think>\n\n" + frag.content;
-                            isThinking = false;
-                        } else {
-                            contentDelta = frag.content;
-                        }
-                    } else if (event.v?.response?.fragments?.length > 0) {
-                        let frag = event.v.response.fragments[0];
-                        contentDelta = frag.content;
-                        if (frag.type === 'THINK') {
-                            isThinking = true;
-                            contentDelta = "<think>\n" + contentDelta;
-                        }
-                        if (event.v.response.message_id) lastMsgId = event.v.response.message_id;
-                        if (event.v.response.parent_id) lastUserMsgId = event.v.response.parent_id;
-                    }
-
-                    if (contentDelta) {
-                        allContent.push(contentDelta);
-                    }
-                }
+                for await (var delta of consumeDS()) allContent.push(delta);
+                var joined = allContent.join('');
+                storePostState(joined);
+                return res.json(buildOpenAIResponse(completionId, model, joined));
             } catch (streamErr) {
                 console.error('[Stream Error]', streamErr.message);
-                if (!lastMsgId) {
-                    allContent.push(`\n\n⚠️ **[PROXY ERROR]** ${streamErr.message}`);
+                if (!res.headersSent) {
+                    return res.status(502).json({
+                        error: { message: streamErr.message, type: 'upstream_error' }
+                    });
                 }
             }
-
-            res.json(buildOpenAIResponse(completionId, model, allContent.join('')));
         }
 
     } catch (err) {
