@@ -2,8 +2,14 @@ FROM node:20-slim
 
 WORKDIR /app
 
-# Clone your updated repository
-RUN git clone https://github.com/Sexlovr/dpsk-2-api.git .
+# git is not bundled in node:20-slim; needed to clone the repo below
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone ONLY the chat-continuation branch (continuation + upstream-error fixes).
+# main is left untouched; this image builds exclusively from chat-continuation.
+RUN git clone --single-branch --branch chat-continuation \
+    https://github.com/Sexlovr/dpsk-2-api.git .
 
 # Install dependencies
 RUN npm install
